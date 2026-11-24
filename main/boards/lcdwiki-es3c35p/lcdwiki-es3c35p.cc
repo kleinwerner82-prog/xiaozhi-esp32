@@ -42,26 +42,51 @@ static esp_err_t touch_i2c_read(uint16_t reg, uint8_t* data, size_t len) {
 
 static void touchpad_read(lv_indev_t*, lv_indev_data_t* data) {
     static int16_t last_x = 0, last_y = 0;
-static bool was_pressed = false;
-static uint32_t press_start_time = 0;
-bool pressed_now = false;
+    static bool was_pressed = false;
+    static uint32_t press_start_time = 0;
+    static int16_t press_start_x = 0, press_start_y = 0;
+    static uint32_t last_diagnostic_time = 0;
+    static uint8_t last_info = 0xFF;
+    static bool last_read_ok = true;
+    bool pressed_now = false;
+
     data->point.x = last_x;
     data->point.y = last_y;
     data->state = LV_INDEV_STATE_RELEASED;
 
-    if (touch_dev_handle == NULL)
+    if (touch_dev_handle == NULL) {
         return;
-    uint8_t info;
-    if (touch_i2c_read(TOUCH_REG_INFO, &info, 1) != ESP_OK)
+    }
+
+    uint8_t info = 0;
+    esp_err_t status = touch_i2c_read(TOUCH_REG_INFO, &info, 1);
+    uint32_t now = lv_tick_get();
+
+    // HORST Touch-Diagnose: nur Aenderungen und alle 3 Sekunden ein Lebenszeichen.
+    // So sehen wir, ob der Controller erreichbar ist und ob sich sein Status aendert.
+    if (status == ESP_OK ? (info != last_info || !last_read_ok || (uint32_t)(now - last_diagnostic_time) >= 3000)
+                         : (last_read_ok || (uint32_t)(now - last_diagnostic_time) >= 3000)) {
+        if (status == ESP_OK) {
+            ESP_LOGI(TAG, "HORST TOUCH: INFO=0x%02X, touch_bit=%d", info, !!(info & 0x08));
+            last_info = info;
+        } else {
+            ESP_LOGW(TAG, "HORST TOUCH: I2C-Lesefehler: %s", esp_err_to_name(status));
+        }
+        last_diagnostic_time = now;
+        last_read_ok = (status == ESP_OK);
+    }
+    if (status != ESP_OK) {
         return;
+    }
+
     if (info & 0x08) {
-        uint8_t buf[7 * 5];
-        if (touch_i2c_read(TOUCH_REG_POINT0, buf, 7 * touch_max_points) == ESP_OK) {
+        uint8_t buf[7 * 5] = {};
+        status = touch_i2c_read(TOUCH_REG_POINT0, buf, 7 * touch_max_points);
+        if (status == ESP_OK) {
             for (int i = 0; i < touch_max_points; i++) {
                 if (buf[i * 7] & 0x80) {
                     int16_t x = ((buf[i * 7] & 0x3F) << 8) | buf[i * 7 + 1];
                     int16_t y = ((buf[i * 7 + 2] & 0x3F) << 8) | buf[i * 7 + 3];
-                    // Ignore jitter < 4px to reduce unwanted scroll on tap
                     int16_t dx = x - last_x, dy = y - last_y;
                     if (dx > 3 || dx < -3 || dy > 3 || dy < -3) {
                         last_x = x;
@@ -72,61 +97,52 @@ bool pressed_now = false;
                     break;
                 }
             }
+        } else if ((uint32_t)(now - last_diagnostic_time) >= 1000) {
+            ESP_LOGW(TAG, "HORST TOUCH: Punktdaten-Lesefehler: %s", esp_err_to_name(status));
+            last_diagnostic_time = now;
         }
     }
 
-// HORST: Doppeltipp-Erkennung
-static int16_t press_start_x = 0;
-static int16_t press_start_y = 0;
+    if (pressed_now && !was_pressed) {
+        ESP_LOGI(TAG, "HORST TOUCH: Finger AUF bei x=%d y=%d", last_x, last_y);
+        press_start_time = now;
+        press_start_x = last_x;
+        press_start_y = last_y;
+    }
 
-if (pressed_now && !was_pressed) {
-     // Finger wurde aufgesetzt
-     press_start_time = lv_tick_get();
-     press_start_x = last_x;
-     press_start_y = last_y;
-}
+    if (!pressed_now && was_pressed) {
+        uint32_t duration = now - press_start_time;
+        ESP_LOGI(TAG, "HORST TOUCH: Finger AB nach %lu ms", (unsigned long)duration);
 
-if (!pressed_now && was_pressed) {
-     // Finger wurde losgelassen
-     uint32_t now = lv_tick_get();
-     uint32_t duration = now - press_start_time;
+        int move_x = last_x - press_start_x;
+        int move_y = last_y - press_start_y;
+        bool short_tap = duration < 250 &&
+                         move_x > -25 && move_x < 25 &&
+                         move_y > -25 && move_y < 25;
 
-     int move_x = last_x - press_start_x;
-     int move_y = last_y - press_start_y;
-
-     bool short_tap = duration < 250 &&
-                      move_x > -25 && move_x < 25 &&
-                      move_y > -25 && move_y < 25;
-
-     if (short_tap) {
-         int dx = last_x - last_tap_x;
-         int dy = last_y - last_tap_y;
-
-         if (last_tap_time != 0 &&
-             (uint32_t)(now - last_tap_time) < 400 &&
-             dx > -40 && dx < 40 &&
-             dy > -40 && dy < 40) {
-
-             ESP_LOGI(TAG, "HORST: Doppeltipp erkannt!");
-
-             auto& app = Application::GetInstance();
-             if (app.GetDeviceState() == kDeviceStateIdle) {
-                 app.ToggleChatState();
-             }
-
-             last_tap_time = 0;
-         } else {
-             last_tap_time = now;
-             last_tap_x = last_x;
-             last_tap_y = last_y;
-         }
-     } else {
-         last_tap_time = 0;
-     }
-}
-
-// HORST: Beruehrungszustand merken
-was_pressed = pressed_now;
+        if (short_tap) {
+            int dx = last_x - last_tap_x;
+            int dy = last_y - last_tap_y;
+            if (last_tap_time != 0 &&
+                (uint32_t)(now - last_tap_time) < 400 &&
+                dx > -40 && dx < 40 &&
+                dy > -40 && dy < 40) {
+                ESP_LOGI(TAG, "HORST: Doppeltipp erkannt!");
+                auto& app = Application::GetInstance();
+                if (app.GetDeviceState() == kDeviceStateIdle) {
+                    app.ToggleChatState();
+                }
+                last_tap_time = 0;
+            } else {
+                last_tap_time = now;
+                last_tap_x = last_x;
+                last_tap_y = last_y;
+            }
+        } else {
+            last_tap_time = 0;
+        }
+    }
+    was_pressed = pressed_now;
 }
 
 // ---- ST77922 init commands ----
